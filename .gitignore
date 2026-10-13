@@ -1,0 +1,4 @@
+# Your results and saved-video lists stay on your computer.
+*.xlsx
+tiktok_saved_videos*.json
+browser-profile/
