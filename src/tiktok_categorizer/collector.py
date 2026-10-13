@@ -63,15 +63,88 @@ _NEW_GRID_LINKS_JS = """
 }
 """
 # Asks TikTok for one more page of your Favorites from inside your logged-in tab:
-# the same request the page itself makes when you scroll down. Null on failure.
+# the same request the page itself makes when you scroll down. On failure it
+# returns what went wrong ({__status: ...} or {__error: ...}).
 _FETCH_PAGE_JS = """
 async (url) => {
   try {
     const response = await fetch(url, {credentials: 'include'});
-    if (!response.ok) return null;
-    return JSON.parse(await response.text());
+    const text = await response.text();
+    if (!response.ok) return {__status: response.status};
+    try { return JSON.parse(text); } catch (e) { return {__status: response.status, __unreadable: true}; }
   } catch (e) {
-    return null;
+    return {__error: String((e && e.message) || e)};
+  }
+}
+"""
+# Used only when scrolling: makes the page *show* just a few videos from each
+# batch TikTok sends (the app still records every video from the network
+# reply), so the page grows ~5x slower and doesn't run out of memory. The first
+# few batches are shown in full so the page is tall enough to keep scrolling.
+# Safe to run more than once.
+_SHOW_FEWER_JS = """
+() => {
+  if (window.__tcShowFewer) return;
+  window.__tcShowFewer = true;
+  const KEEP = 6, MIN_TILES = 60;
+  const isList = (u) => {
+    try {
+      const path = new URL(String(u), location.href).pathname;
+      return path.includes('/api/') && path.includes('collect') && path.includes('item_list');
+    } catch (e) { return false; }
+  };
+  const pageIsLong = () =>
+    document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]').length >= MIN_TILES;
+  const fewer = (data) => {
+    if (data && Array.isArray(data.itemList) && data.itemList.length > KEEP) {
+      return Object.assign({}, data, {itemList: data.itemList.slice(0, KEEP)});
+    }
+    return data;
+  };
+  const fewerText = (text) => {
+    try { const data = JSON.parse(text); const less = fewer(data); return less === data ? text : JSON.stringify(less); }
+    catch (e) { return text; }
+  };
+
+  const pageFetch = window.fetch;
+  window.fetch = async function (input) {
+    const response = await pageFetch.apply(this, arguments);
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!isList(url) || !pageIsLong()) return response;
+    try {
+      const text = fewerText(await response.clone().text());
+      const headers = new Headers(response.headers);
+      headers.delete('content-length');
+      headers.delete('content-encoding');
+      const shorter = new Response(text, {status: response.status, statusText: response.statusText, headers});
+      Object.defineProperty(shorter, 'url', {value: response.url});
+      return shorter;
+    } catch (e) {
+      return response;
+    }
+  };
+
+  const proto = XMLHttpRequest.prototype;
+  const open = proto.open;
+  proto.open = function (method, url) {
+    this.__tcList = isList(url);
+    this.__tcShown = undefined;
+    return open.apply(this, arguments);
+  };
+  for (const name of ['responseText', 'response']) {
+    const original = Object.getOwnPropertyDescriptor(proto, name);
+    if (!original || !original.get) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      enumerable: original.enumerable,
+      get() {
+        const value = original.get.call(this);
+        if (!this.__tcList || this.readyState !== 4) return value;
+        if (this.__tcShown === undefined) this.__tcShown = pageIsLong();
+        if (!this.__tcShown) return value;
+        return typeof value === 'string' ? fewerText(value) : fewer(value);
+      },
+    });
   }
 }
 """
@@ -83,12 +156,14 @@ _SCROLL_JS = """
 }
 """
 # Already at the bottom, scrolling down again changes nothing, so the page never
-# asks for more. Backing up a little first makes it notice the next scroll.
+# asks for more. Backing up first makes it notice the next scroll. Pages that
+# start loading well before the bottom need a bigger back-up, so it is given
+# in screen heights (at least 600px).
 _BACK_UP_JS = """
-() => {
+(screens) => {
   const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
   if (links.length > 3) links[links.length - 4].scrollIntoView({block: 'end'});
-  window.scrollBy(0, -600);
+  window.scrollBy(0, -Math.max(600, screens * window.innerHeight));
 }
 """
 # Video files (hover previews): not needed to read captions, and heavy on a long
@@ -180,6 +255,23 @@ def next_page_urls(template: str, cursor: Any) -> list[str]:
         return urlunsplit(parts._replace(query=urlencode(params)))
 
     return list(dict.fromkeys([build(True), build(False)]))
+
+
+def _describe(answer: Any) -> str:
+    """A short note on why a direct answer couldn't be used (shown when falling back)."""
+    if not isinstance(answer, dict):
+        return "no answer"
+    if "__error" in answer:
+        return "network error"
+    if "__status" in answer:
+        unreadable = ", unreadable reply" if answer.get("__unreadable") else ""
+        return f"HTTP {answer['__status']}{unreadable}"
+    code = answer.get("statusCode", answer.get("status_code"))
+    if code not in (0, None):
+        return f"TikTok code {code}"
+    if not answer.get("itemList"):
+        return "empty reply"
+    return "no new videos in the reply"
 
 
 def _page_cursor(payload: Any) -> Any:
@@ -294,18 +386,19 @@ def _page_directly(
     wait: Callable[[float], None],
     stop_check: Callable[[], None],
     log: Log,
-) -> bool | None:
+) -> bool | str:
     """Fetch the rest of the Favorites a page at a time, without scrolling.
 
-    Returns True at the end of the list (or the limit), None if TikTok doesn't
-    answer this way, so scrolling should carry on instead. A request form is
+    Returns True at the end of the list (or the limit); otherwise TikTok doesn't
+    answer this way and it returns a short reason, so scrolling should carry on
+    instead. A request form is
     trusted only after it has returned real videos: refusals can look like an
     empty last page, and must never end the run early.
     """
     variant: int | None = None  # which form of the request works, once proven
     while True:
         urls = next_page_urls(template, cursor)
-        payload, videos, has_more = None, [], True
+        payload, videos, has_more, reason = None, [], True, "no answer"
         if variant is None:
             tries = [(index, 0.0) for index in range(len(urls))]
         else:
@@ -315,6 +408,7 @@ def _page_directly(
             if delay:
                 wait(delay)
             answer = fetch(urls[index])
+            reason = _describe(answer)
             found, more = videos_from_api_payload(answer)
             if found and any(v.key not in seen_here for v in found):
                 payload, videos, has_more, variant = answer, found, more, index
@@ -324,7 +418,7 @@ def _page_directly(
                 payload, has_more = answer, False
                 break
         if payload is None:
-            return None
+            return reason
         before = len(collected.found)
         for video in videos:
             seen_here.add(video.key)
@@ -336,7 +430,7 @@ def _page_directly(
             return True
         cursor = _page_cursor(payload)
         if cursor is None:
-            return None
+            return "no position for the next batch"
         wait(pause)
 
 
@@ -411,12 +505,17 @@ def _scroll_favorites(
                 scrolled.add(video.key)
                 collected.add(video)
         if direct and template and has_more and cursor is not None:
-            if _page_directly(fetch, template, cursor, collected, seen_here, limit=limit,
-                              pause=scroll_pause / 2, log=log, stop_check=stop_check,
-                              wait=lambda seconds: page.wait_for_timeout(int(seconds * 1000))):
+            result = _page_directly(fetch, template, cursor, collected, seen_here, limit=limit,
+                                    pause=scroll_pause / 2, log=log, stop_check=stop_check,
+                                    wait=lambda seconds: page.wait_for_timeout(int(seconds * 1000)))
+            if result is True:
                 break
             direct = False
-            log("  TikTok wants this done by scrolling; carrying on that way...")
+            log(f"  TikTok wants this done by scrolling ({result}); carrying on that way. To save "
+                "memory, the browser will now show only a few videos from each batch; the app "
+                "still records all of them.")
+        if not direct:
+            page.evaluate(_SHOW_FEWER_JS)  # again after any reload; it only installs once
         for link in page.evaluate(_NEW_GRID_LINKS_JS):
             if link["href"] in own_posts:
                 continue
@@ -461,8 +560,12 @@ def _scroll_favorites(
         elif moved and rounds % 10 == 0:
             log(f"  catching up: passed {len(scrolled)} of the {len(collected.found)} videos found earlier...")
         if not moved:
-            page.evaluate(_BACK_UP_JS)
-            page.wait_for_timeout(300)
+            # While showing fewer videos the page grows only a row or two per
+            # batch, so a page that loads early can stay "at the bottom": back
+            # up further each quiet round (3, 6, 9... screens) to wake it up.
+            screens = 0 if direct else 3 * min(idle, 4)
+            page.evaluate(_BACK_UP_JS, screens)
+            page.wait_for_timeout(500 if screens else 300)
         page.evaluate(_SCROLL_JS)
         page.wait_for_timeout(int(scroll_pause * 1000))
 
