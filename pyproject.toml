@@ -14,6 +14,10 @@ dependencies = [
   "playwright>=1.45",
 ]
 
+[project.urls]
+Repository = "https://github.com/vgdikyan-droid/tiktok-categorizer"
+Issues = "https://github.com/vgdikyan-droid/tiktok-categorizer/issues"
+
 [project.optional-dependencies]
 ai = ["anthropic>=1.13,<2"]
 dev = ["pytest>=8.0,<9.0"]

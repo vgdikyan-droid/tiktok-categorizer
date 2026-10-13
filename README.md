@@ -27,20 +27,28 @@ Nothing is downloaded, and you never type your password into this tool. The
 browser remembers your login in a folder on your computer
 (`~/.tiktok-categorizer/browser-profile`), so you only log in once.
 
-## One-time setup
+## One-time setup (Mac)
 
-You need a computer (Mac, Windows or Linux) with **Python 3.10 or newer** and,
-ideally, **Google Chrome**.
+You need a Mac with **Python 3.10 or newer** (install it from
+[python.org/downloads](https://www.python.org/downloads/); the `python3` that
+comes with macOS is often too old) and, ideally, **Google Chrome**.
+
+1. Get the code: on this repository's GitHub page click **Code → Download ZIP**
+   and unzip it, or run `git clone https://github.com/vgdikyan-droid/tiktok-categorizer.git`.
+2. Open **Terminal**, type `cd ` (with a space), drag the unzipped folder into the
+   window and press Enter.
+3. Run:
 
 ```bash
-git clone https://github.com/vgdikyan-droid/restaurant-ops-mcp.git
-cd restaurant-ops-mcp/tiktok-categorizer
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -e ".[ai]"
 ```
 
 If you don't have Google Chrome, also run `playwright install chromium`.
+
+Each later time, open Terminal in the folder and run `source .venv/bin/activate`
+before using `tiktok-categorize`.
 
 ## Run it
 
@@ -52,8 +60,8 @@ tiktok-categorize                  # everything
 A browser window opens. Log in if asked, then leave the window alone while it
 scrolls. When it finishes you'll have:
 
-- `tiktok_saved_videos.xlsx`, the spreadsheet. It opens in Excel or Numbers,
-  or you can upload it to Google Sheets.
+- `tiktok_saved_videos.xlsx`, the spreadsheet. Open it with `open tiktok_saved_videos.xlsx`
+  (Numbers or Excel), or upload it to Google Sheets.
 - `tiktok_saved_videos.json`, the list of videos it found, so you can re-sort without
   scrolling TikTok again (see below).
 
@@ -76,7 +84,7 @@ end up in *Uncategorized*. With `--ai`, Claude reads each caption and picks
 the best categories, which works much better.
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...      # Windows PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY=sk-ant-...
 tiktok-categorize --ai
 ```
 
