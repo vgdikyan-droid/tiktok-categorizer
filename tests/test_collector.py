@@ -143,7 +143,8 @@ def browser_page():
 
 def _serve_fake_tiktok(page, api_path: str, total: int = 10, *, signed_only: bool = False,
                        refuse_direct_from: int | None = None, soft_block: bool = False,
-                       flaky: tuple = ()) -> list:
+                       flaky: tuple = (), per_page: int = 3, xhr: bool = False,
+                       html: str | None = None) -> list:
     """Serve a fake profile. The page signs its own data requests (like TikTok's
     X-Bogus); requests the app makes itself are "direct". Knobs for how TikTok
     might treat direct requests: signed_only refuses them all with an empty body,
@@ -157,7 +158,15 @@ def _serve_fake_tiktok(page, api_path: str, total: int = 10, *, signed_only: boo
     def handle(route):
         url = urlsplit(route.request.url)
         if url.path == "/@me":
-            route.fulfill(content_type="text/html", body=PROFILE_HTML.replace("__API__", api_path))
+            page_html = (html or PROFILE_HTML).replace("__API__", api_path)
+            if xhr:  # load batches with XMLHttpRequest instead of fetch
+                page_html = page_html.replace(
+                    "const data = await (await fetch(API + '?count=3&cursor=' + cursor + '&X-Bogus=sig' + cursor)).json();",
+                    "const data = await new Promise(done => { const x = new XMLHttpRequest();"
+                    " x.open('GET', API + '?count=3&cursor=' + cursor + '&X-Bogus=sig' + cursor);"
+                    " x.onload = () => done(JSON.parse(x.responseText)); x.send(); });")
+                assert "XMLHttpRequest" in page_html
+            route.fulfill(content_type="text/html", body=page_html)
         elif url.path == api_path:
             query = parse_qs(url.query)
             cursor = int(query.get("cursor", ["0"])[0])
@@ -178,7 +187,8 @@ def _serve_fake_tiktok(page, api_path: str, total: int = 10, *, signed_only: boo
                 failed_once.add(cursor)
                 route.fulfill(status=500, body="")
                 return
-            route.fulfill(content_type="application/json", body=json.dumps(_page_of(cursor, total=total)))
+            route.fulfill(content_type="application/json",
+                          body=json.dumps(_page_of(cursor, per_page=per_page, total=total)))
         else:
             route.fulfill(status=404, body="")
 
@@ -482,3 +492,81 @@ def test_crash_recovery_in_a_visible_browser_like_the_apps(tmp_path):
                                    ask=_unexpected_prompt, log=log)
         context.close()
     assert crashed and len(videos) == 30
+
+
+def _tiles(page) -> int:
+    return page.evaluate("document.querySelectorAll('a[href*=\"/video/\"]').length")
+
+
+@pytest.mark.parametrize("xhr", [False, True], ids=["fetch", "xhr"])
+def test_scrolling_shows_only_a_few_videos_per_batch_but_records_all(browser_page, xhr):
+    # TikTok refuses direct requests, so the app scrolls; batches of 30 like TikTok's.
+    _serve_fake_tiktok(browser_page, API, total=900, per_page=30, signed_only=True, xhr=xhr)
+    logs = []
+    videos = collect_favorites(browser_page, "me", scroll_pause=0.3, idle_rounds=4,
+                               ask=_unexpected_prompt, log=logs.append)
+    assert len({v.key for v in videos}) == len(videos) == 900
+    assert videos[899].caption.endswith(" 899")
+    assert _tiles(browser_page) < 250  # instead of 900
+    assert any("by scrolling (HTTP 200, unreadable reply)" in m for m in logs)
+
+
+def test_direct_requests_are_never_shortened(browser_page):
+    requests = _serve_fake_tiktok(browser_page, API, total=300, per_page=30)
+    videos = collect_favorites(browser_page, "me", scroll_pause=0.3, idle_rounds=3,
+                               ask=_unexpected_prompt, log=lambda _: None)
+    assert len(videos) == 300
+    assert requests == list(range(0, 300, 30))
+
+
+# A TikTok-like grid: several columns, and more videos load when a marker below
+# the grid comes within MARGIN pixels of the screen (an IntersectionObserver).
+GRID_HTML = """<!doctype html><html><body style="margin:0">
+<nav><a data-e2e="nav-profile" href="/@me">Profile</a></nav>
+<div id="tabs"><p>Videos</p><p data-e2e="favorites-tab">Favorites</p></div>
+<div id="grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px"></div>
+<div id="marker" style="height:40px">loading</div>
+<script>
+let cursor = 0, hasMore = true, loading = false;
+const API = '__API__';
+async function loadMore() {
+  if (loading || !hasMore) return;
+  loading = true;
+  const data = await (await fetch(API + '?count=30&cursor=' + cursor + '&X-Bogus=sig' + cursor)).json();
+  for (const item of data.itemList) {
+    const a = document.createElement('a');
+    a.href = '/@' + item.author.uniqueId + '/video/' + item.id;
+    a.style.cssText = 'display:block;height:330px';
+    a.innerHTML = '<img alt="' + item.desc + ' created by ' + item.author.uniqueId + ' with a sound">';
+    document.getElementById('grid').appendChild(a);
+  }
+  cursor = data.cursor; hasMore = data.hasMore; loading = false;
+}
+document.querySelector('[data-e2e=favorites-tab]').addEventListener('click', () => {
+  loadMore();
+  new IntersectionObserver(entries => { if (entries[0].isIntersecting) loadMore(); },
+    {rootMargin: '0px 0px MARGINpx 0px'}).observe(document.getElementById('marker'));
+});
+</script></body></html>"""
+
+
+@pytest.mark.parametrize("margin", [600, 1000])
+def test_a_page_that_loads_early_keeps_loading_while_showing_fewer(browser_page, margin):
+    browser_page.set_viewport_size({"width": 1280, "height": 800})
+    _serve_fake_tiktok(browser_page, API, total=900, per_page=30, signed_only=True,
+                       html=GRID_HTML.replace("MARGIN", str(margin)))
+    videos = collect_favorites(browser_page, "me", scroll_pause=0.3, idle_rounds=6,
+                               ask=_unexpected_prompt, log=lambda _: None)
+    assert len({v.key for v in videos}) == len(videos) == 900
+    assert _tiles(browser_page) < 300
+
+
+def test_a_resumed_run_gets_past_last_time_on_such_a_page(browser_page):
+    browser_page.set_viewport_size({"width": 1280, "height": 800})
+    _serve_fake_tiktok(browser_page, API, total=900, per_page=30, signed_only=True,
+                       html=GRID_HTML.replace("MARGIN", "600"))
+    known = [video_from_api_item(item) for cursor in range(0, 600, 30)
+             for item in _page_of(cursor, per_page=30, total=900)["itemList"]]
+    videos = collect_favorites(browser_page, "me", known=known, scroll_pause=0.3, idle_rounds=6,
+                               ask=_unexpected_prompt, log=lambda _: None)
+    assert len({v.key for v in videos}) == len(videos) == 900
