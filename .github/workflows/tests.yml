@@ -27,7 +27,7 @@ jobs:
           python -m pip install -e ".[ai,dev]"
           python -m playwright install --with-deps chromium
 
-      - name: Run tests
+      - name: Run tests (with a virtual display for the visible-browser test)
         env:
           TIKTOK_REQUIRE_BROWSER_TESTS: "1"
-        run: pytest -q
+        run: xvfb-run -a pytest -q -rs

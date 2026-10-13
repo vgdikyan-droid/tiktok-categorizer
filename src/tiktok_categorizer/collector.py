@@ -8,18 +8,28 @@ your Favorites tab and record each video.
 Two sources are combined so a TikTok site change is less likely to break a run:
 the JSON the page loads for the Favorites grid (captions included), and the
 video links visible in the grid itself (captions read from thumbnail alt text).
+
+Big collections (thousands of saves) used to exhaust the browser tab's memory,
+because every video scrolled past stays on the page. So once the page has
+loaded its first batch, we ask TikTok for the following batches directly from
+the same tab, the request the page itself makes when you scroll, and nothing
+piles up. If TikTok won't answer that way we scroll as before, skipping video
+previews. Either way we reopen the tab if it crashes and report progress so it
+can be saved as we go.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import re
 import time
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from tiktok_categorizer.models import SavedVideo, video_id_from_url
 
@@ -31,10 +41,39 @@ _SESSION_COOKIES = {"sessionid", "sessionid_ss", "sid_tt"}
 _ALT_RE = re.compile(r"^(?P<caption>.*?)\s*created by (?P<creator>.+?) with .*$", re.S)
 _CANONICAL_RE = re.compile(r"^/@(?P<user>[^/]+)/(?P<kind>video|photo)/(?P<id>\d{8,25})")
 
-# Gathers grid links with their thumbnail alt text, in page order.
-_DOM_LINKS_JS = """
-() => Array.from(document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]'))
-  .map(a => { const img = a.querySelector('img[alt]'); return {href: a.href, alt: img ? img.alt : ''}; })
+# Every grid link on the page, without marking anything (for the own-posts snapshot).
+_ALL_GRID_LINKS_JS = """
+() => Array.from(document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]'), a => a.href)
+"""
+# Returns grid links not read before (with thumbnail alt text), in page order,
+# and marks them so later rounds only look at new tiles. A tile whose alt text
+# hasn't appeared yet is retried a few times before being taken as it is.
+_NEW_GRID_LINKS_JS = """
+() => {
+  const out = [];
+  for (const a of document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]')) {
+    if (a.dataset.tcSeen === a.href) continue;
+    const img = a.querySelector('img[alt]');
+    const alt = img ? img.alt : '';
+    const tries = Number(a.dataset.tcTries || 0) + 1;
+    if (alt || tries >= 3) { a.dataset.tcSeen = a.href; } else { a.dataset.tcTries = String(tries); }
+    if (alt || tries >= 3) out.push({href: a.href, alt: alt});
+  }
+  return out;
+}
+"""
+# Asks TikTok for one more page of your Favorites from inside your logged-in tab:
+# the same request the page itself makes when you scroll down. Null on failure.
+_FETCH_PAGE_JS = """
+async (url) => {
+  try {
+    const response = await fetch(url, {credentials: 'include'});
+    if (!response.ok) return null;
+    return JSON.parse(await response.text());
+  } catch (e) {
+    return null;
+  }
+}
 """
 _SCROLL_JS = """
 () => {
@@ -52,12 +91,36 @@ _BACK_UP_JS = """
   window.scrollBy(0, -600);
 }
 """
+# Video files (hover previews): not needed to read captions, and heavy on a long
+# scroll. Thumbnails still load, because tiles may be sized by their images and
+# the page only loads more videos as you reach the bottom. Scripts, data and
+# puzzle images use other addresses.
+_HEAVY_MEDIA_URLS = [
+    "*/video/tos/*",
+    "*/aweme/v1/play/*",
+    "*mime_type=video*",
+]
+# The same in the newer URLPattern form, for Chrome versions that want it
+# (by path only: a "?" in these patterns means "optional", not the query).
+_HEAVY_MEDIA_URL_PATTERNS = [
+    "*://*/video/tos/*",
+    "*://*/aweme/v1/play/*",
+]
 
 Log = Callable[[str], None]
+Progress = Callable[[list[SavedVideo]], None]
 
 
 class CollectorError(RuntimeError):
     """A problem the person running the tool needs to fix or retry."""
+
+
+class CollectionStopped(CollectorError):
+    """Collecting stopped early; `videos` holds everything found until then."""
+
+    def __init__(self, message: str, videos: list[SavedVideo]):
+        super().__init__(message)
+        self.videos = videos
 
 
 def is_saved_list_response(url: str) -> bool:
@@ -99,6 +162,36 @@ def videos_from_api_payload(payload: Any) -> tuple[list[SavedVideo], bool]:
     return videos, bool(payload.get("hasMore", True))
 
 
+_SIGNATURE_PARAMS = {"X-Bogus", "X-Gnarly", "_signature"}
+
+
+def next_page_urls(template: str, cursor: Any) -> list[str]:
+    """Ways to ask for the Favorites page at `cursor`, based on a request TikTok's
+    own page made: without its old signature first (so the page can sign it
+    afresh), then exactly as the page sent it apart from the cursor."""
+    parts = urlsplit(template)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+
+    def build(drop_signature: bool) -> str:
+        params = [(k, str(cursor) if k == "cursor" else v) for k, v in query
+                  if not (drop_signature and k in _SIGNATURE_PARAMS)]
+        if not any(k == "cursor" for k, _ in params):
+            params.append(("cursor", str(cursor)))
+        return urlunsplit(parts._replace(query=urlencode(params)))
+
+    return list(dict.fromkeys([build(True), build(False)]))
+
+
+def _page_cursor(payload: Any) -> Any:
+    return payload.get("cursor") if isinstance(payload, dict) else None
+
+
+def _is_last_page(payload: Any) -> bool:
+    """An empty final page TikTok confirms as the end (statusCode 0, hasMore false)."""
+    return (isinstance(payload, dict) and payload.get("statusCode", payload.get("status_code")) == 0
+            and not payload.get("hasMore", True))
+
+
 def video_from_grid_link(href: str, alt: str) -> SavedVideo | None:
     parts = urlsplit(href)
     match = _CANONICAL_RE.match(parts.path)
@@ -118,23 +211,58 @@ def video_from_grid_link(href: str, alt: str) -> SavedVideo | None:
     return SavedVideo(url=url, caption=caption, creator=creator)
 
 
-def _add(found: dict[str, SavedVideo], video: SavedVideo) -> bool:
-    existing = found.get(video.key)
-    if existing is None:
-        found[video.key] = video
-        return True
-    # A later source may know more (the JSON has full captions and post dates).
-    if not existing.caption and video.caption:
-        existing.caption = video.caption
-    if not existing.creator and video.creator:
-        existing.creator = video.creator
-    if not existing.posted_at and video.posted_at:
-        existing.posted_at = video.posted_at
-    return False
+class _Collected:
+    """Videos found so far, kept across tab restarts and saved every so often."""
+
+    def __init__(self, known: list[SavedVideo], on_progress: Progress | None, save_every: int):
+        self.found: dict[str, SavedVideo] = {}
+        for video in known:
+            self.add(video)
+        self.known_keys = set(self.found)
+        self.known = len(self.found)
+        self._on_progress = on_progress
+        self._save_every = save_every
+        self._saved_at = len(self.found)
+
+    def add(self, video: SavedVideo) -> bool:
+        existing = self.found.get(video.key)
+        if existing is None:
+            self.found[video.key] = video
+            return True
+        # A later source may know more (the JSON has full captions and post dates).
+        if not existing.caption and video.caption:
+            existing.caption = video.caption
+        if not existing.creator and video.creator:
+            existing.creator = video.creator
+        if not existing.posted_at and video.posted_at:
+            existing.posted_at = video.posted_at
+        return False
+
+    def videos(self) -> list[SavedVideo]:
+        return list(self.found.values())
+
+    def save(self, *, force: bool = False) -> None:
+        if self._on_progress and (force or len(self.found) - self._saved_at >= self._save_every):
+            self._on_progress(self.videos())
+            self._saved_at = len(self.found)
 
 
-def _grid_links(page: Any) -> list[dict[str, str]]:
-    return page.evaluate(_DOM_LINKS_JS)
+def _skip_heavy_media(page: Any, log: Log) -> Any:
+    """Stop this tab loading video files. Returns the session doing it."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        session = page.context.new_cdp_session(page)
+        session.send("Network.enable")
+        try:
+            session.send("Network.setBlockedURLs", {"urls": _HEAVY_MEDIA_URLS})
+        except PlaywrightError:
+            session.send("Network.setBlockedURLs", {"urlPatterns": [
+                {"urlPattern": pattern, "block": True} for pattern in _HEAVY_MEDIA_URL_PATTERNS]})
+        return session
+    except PlaywrightError:
+        log("  (couldn't switch off video previews in this browser; carrying on with them)")
+        return None
 
 
 def _open_favorites_tab(page: Any) -> bool:
@@ -154,6 +282,191 @@ def _open_favorites_tab(page: Any) -> bool:
     return False
 
 
+def _page_directly(
+    fetch: Callable[[str], Any],
+    template: str,
+    cursor: Any,
+    collected: _Collected,
+    seen_here: set[str],
+    *,
+    limit: int | None,
+    pause: float,
+    wait: Callable[[float], None],
+    stop_check: Callable[[], None],
+    log: Log,
+) -> bool | None:
+    """Fetch the rest of the Favorites a page at a time, without scrolling.
+
+    Returns True at the end of the list (or the limit), None if TikTok doesn't
+    answer this way, so scrolling should carry on instead. A request form is
+    trusted only after it has returned real videos: refusals can look like an
+    empty last page, and must never end the run early.
+    """
+    variant: int | None = None  # which form of the request works, once proven
+    while True:
+        urls = next_page_urls(template, cursor)
+        payload, videos, has_more = None, [], True
+        if variant is None:
+            tries = [(index, 0.0) for index in range(len(urls))]
+        else:
+            tries = [(variant, 0.0), (variant, 2.0), (variant, 5.0)]  # ride out a hiccup
+        for index, delay in tries:
+            stop_check()
+            if delay:
+                wait(delay)
+            answer = fetch(urls[index])
+            found, more = videos_from_api_payload(answer)
+            if found and any(v.key not in seen_here for v in found):
+                payload, videos, has_more, variant = answer, found, more, index
+                break
+            if (not found and variant is not None and _is_last_page(answer)
+                    and str(_page_cursor(answer)) not in ("0", "", "None")):
+                payload, has_more = answer, False
+                break
+        if payload is None:
+            return None
+        before = len(collected.found)
+        for video in videos:
+            seen_here.add(video.key)
+            collected.add(video)
+        collected.save()
+        if len(collected.found) > before:
+            log(f"  found {len(collected.found)} saved videos so far...")
+        if not has_more or (limit and len(collected.found) >= limit):
+            return True
+        cursor = _page_cursor(payload)
+        if cursor is None:
+            return None
+        wait(pause)
+
+
+def _scroll_favorites(
+    page: Any,
+    username: str,
+    collected: _Collected,
+    *,
+    base_url: str,
+    limit: int | None,
+    scroll_pause: float,
+    idle_rounds: int,
+    ask: Callable[[str], str],
+    stop_check: Callable[[], None],
+    log: Log,
+) -> None:
+    """Scroll one tab's Favorites to the end, adding everything to `collected`."""
+    pending: list[Any] = []
+    # The app's own direct requests (see _page_directly) must not count as what
+    # the page has shown, or scrolling would think it is further along than it is.
+    own_requests: set[str] = set()
+    fetching = [False]
+
+    def on_response(response: Any) -> None:
+        if (is_saved_list_response(response.url) and not fetching[0]
+                and response.request.url not in own_requests):
+            pending.append(response)
+
+    def fetch(url: str) -> Any:
+        own_requests.add(url)
+        fetching[0] = True
+        try:
+            return page.evaluate(_FETCH_PAGE_JS, url)
+        finally:
+            fetching[0] = False
+
+    page.on("response", on_response)
+    blocker = _skip_heavy_media(page, log)  # kept in a variable so it stays active while scrolling
+
+    page.goto(urljoin(base_url, f"@{username}"), wait_until="domcontentloaded")
+    page.wait_for_timeout(2500)
+    # Links on the profile before switching tabs are your own posts, not saves.
+    own_posts = set(page.evaluate(_ALL_GRID_LINKS_JS))
+
+    if not _open_favorites_tab(page):
+        ask(
+            "Couldn't find the Favorites tab automatically. In the browser window, "
+            "click the Favorites tab (bookmark icon) on your profile, then press Enter here..."
+        )
+        stop_check()
+    page.wait_for_timeout(2500)
+
+    seen_here: set[str] = set()  # everything this tab has seen, including videos already known
+    scrolled: set[str] = set()  # what the page itself has shown: how far scrolling has got
+    has_more = True
+    template, cursor, direct = None, None, True
+    idle = rounds = 0
+    while True:
+        stop_check()
+        rounds += 1
+        before_scrolled, before_found = len(scrolled), len(collected.found)
+        while pending:
+            response = pending.pop(0)
+            try:
+                payload = response.json()
+            except Exception:  # an aborted or non-JSON response: the next page retries
+                continue
+            videos, has_more = videos_from_api_payload(payload)
+            template, cursor = response.url, _page_cursor(payload)
+            for video in videos:
+                seen_here.add(video.key)
+                scrolled.add(video.key)
+                collected.add(video)
+        if direct and template and has_more and cursor is not None:
+            if _page_directly(fetch, template, cursor, collected, seen_here, limit=limit,
+                              pause=scroll_pause / 2, log=log, stop_check=stop_check,
+                              wait=lambda seconds: page.wait_for_timeout(int(seconds * 1000))):
+                break
+            direct = False
+            log("  TikTok wants this done by scrolling; carrying on that way...")
+        for link in page.evaluate(_NEW_GRID_LINKS_JS):
+            if link["href"] in own_posts:
+                continue
+            video = video_from_grid_link(link["href"], link.get("alt", ""))
+            if video:
+                seen_here.add(video.key)
+                scrolled.add(video.key)
+                collected.add(video)
+        collected.save()
+
+        if limit and len(collected.found) >= limit:
+            break
+        moved = len(scrolled) > before_scrolled
+        idle = 0 if moved else idle + 1
+        if not has_more and idle >= 2:
+            break  # TikTok said this was the last page
+        if idle >= idle_rounds:
+            passed = len(collected.known_keys & seen_here)
+            if passed < collected.known:
+                answer = ask(
+                    f"The page stopped loading after passing {passed} of the {collected.known} videos "
+                    "found last time. If the browser is showing a puzzle or stopped loading, sort it out "
+                    "and type 'more' to keep going; otherwise press Enter to stop for now (nothing is "
+                    "lost, and the next run carries on): "
+                )
+                stop_check()
+                if answer.strip().lower() not in ("more", "m"):
+                    raise CollectionStopped("Stopped before getting past the videos found last time.",
+                                            collected.videos())
+            else:
+                answer = ask(
+                    f"No new videos for a while ({len(collected.found)} found). That's usually the end "
+                    "of your Favorites. If the browser is showing a puzzle or stopped loading, sort it "
+                    "out and type 'more' to keep going; otherwise press Enter to finish: "
+                )
+                stop_check()
+                if answer.strip().lower() not in ("more", "m"):
+                    break
+            idle = 0
+        if len(collected.found) > before_found:
+            log(f"  found {len(collected.found)} saved videos so far...")
+        elif moved and rounds % 10 == 0:
+            log(f"  catching up: passed {len(scrolled)} of the {len(collected.found)} videos found earlier...")
+        if not moved:
+            page.evaluate(_BACK_UP_JS)
+            page.wait_for_timeout(300)
+        page.evaluate(_SCROLL_JS)
+        page.wait_for_timeout(int(scroll_pause * 1000))
+
+
 def collect_favorites(
     page: Any,
     username: str,
@@ -162,68 +475,72 @@ def collect_favorites(
     limit: int | None = None,
     scroll_pause: float = 1.5,
     idle_rounds: int = 6,
+    known: list[SavedVideo] | None = None,
+    on_progress: Progress | None = None,
+    save_every: int = 100,
+    max_restarts: int = 3,
+    should_stop: Callable[[], bool] = lambda: False,
     ask: Callable[[str], str] = input,
     log: Log = print,
 ) -> list[SavedVideo]:
-    """Scroll the Favorites tab of `username` until no new videos appear."""
-    pending: list[Any] = []
-    page.on("response", lambda r: pending.append(r) if is_saved_list_response(r.url) else None)
+    """Scroll the Favorites tab of `username` until no new videos appear.
 
-    page.goto(urljoin(base_url, f"@{username}"), wait_until="domcontentloaded")
-    page.wait_for_timeout(2500)
-    # Links on the profile before switching tabs are your own posts, not saves.
-    own_posts = {link["href"] for link in _grid_links(page)}
+    `known` are videos found by an earlier, unfinished run; they are kept and
+    scrolled past. `on_progress` receives the full list every `save_every` new
+    videos. If the tab crashes, a new one picks up where it left off, up to
+    `max_restarts` times. `should_stop` is checked between steps (for a clean
+    Control-C). If collecting stops early for any reason, the CollectionStopped
+    error carries everything found until then.
+    """
+    from playwright.sync_api import Error as PlaywrightError
 
-    if not _open_favorites_tab(page):
-        ask(
-            "Couldn't find the Favorites tab automatically. In the browser window, "
-            "click the Favorites tab (bookmark icon) on your profile, then press Enter here..."
-        )
-    page.wait_for_timeout(2500)
+    collected = _Collected(known or [], on_progress, save_every)
 
-    found: dict[str, SavedVideo] = {}
-    has_more = True
-    idle = 0
-    while True:
-        new = 0
-        while pending:
-            response = pending.pop(0)
+    def stop_check() -> None:
+        if should_stop():
+            raise CollectionStopped("Stopped.", collected.videos())
+
+    if collected.known:
+        log(f"Continuing from last time: {collected.known} videos already found. "
+            "Scrolling past those first...")
+    restarts = 0
+    crashed_at = -1
+    try:
+        while True:
+            crashes: list[Any] = []
+            page.on("crash", lambda _page: crashes.append(True))
             try:
-                payload = response.json()
-            except Exception:  # an aborted or non-JSON response: the next page retries
-                continue
-            videos, has_more = videos_from_api_payload(payload)
-            new += sum(_add(found, video) for video in videos)
-        for link in _grid_links(page):
-            if link["href"] in own_posts:
-                continue
-            video = video_from_grid_link(link["href"], link.get("alt", ""))
-            if video:
-                new += _add(found, video)
-
-        if limit and len(found) >= limit:
-            break
-        idle = 0 if new else idle + 1
-        if not has_more and idle >= 2:
-            break  # TikTok said this was the last page
-        if idle >= idle_rounds:
-            answer = ask(
-                f"No new videos for a while ({len(found)} found). That's usually the end of your "
-                "Favorites. If the browser is showing a puzzle or stopped loading, sort it out and "
-                "type 'more' to keep going; otherwise press Enter to finish: "
-            )
-            if answer.strip().lower() not in ("more", "m"):
+                _scroll_favorites(page, username, collected, base_url=base_url, limit=limit,
+                                  scroll_pause=scroll_pause, idle_rounds=idle_rounds, ask=ask,
+                                  stop_check=stop_check, log=log)
                 break
-            idle = 0
-        if new:
-            log(f"  found {len(found)} saved videos so far...")
-        else:
-            page.evaluate(_BACK_UP_JS)
-            page.wait_for_timeout(300)
-        page.evaluate(_SCROLL_JS)
-        page.wait_for_timeout(int(scroll_pause * 1000))
+            except PlaywrightError as exc:
+                if not crashes and "crash" not in str(exc).lower():
+                    raise
+                collected.save(force=True)
+                if restarts >= max_restarts or len(collected.found) == crashed_at:
+                    raise CollectionStopped(
+                        f"TikTok's page kept crashing (after {len(collected.found)} videos).",
+                        collected.videos(),
+                    ) from exc
+                restarts += 1
+                crashed_at = len(collected.found)
+                log(f"The TikTok tab crashed after {len(collected.found)} videos. "
+                    f"Reopening it and carrying on (attempt {restarts} of {max_restarts})...")
+                # Open the new tab before closing the crashed one: closing a
+                # browser's last tab can quit the browser.
+                crashed_page, page = page, page.context.new_page()
+                try:
+                    crashed_page.close()
+                except PlaywrightError:
+                    pass
+    except KeyboardInterrupt:
+        raise CollectionStopped("Stopped.", collected.videos()) from None
+    except PlaywrightError as exc:
+        raise CollectionStopped(
+            f"The browser closed or stopped responding ({exc}).", collected.videos()) from exc
 
-    videos = list(found.values())
+    videos = collected.videos()
     return videos[:limit] if limit else videos
 
 
@@ -235,7 +552,13 @@ def is_logged_in(context: Any) -> bool:
 
 
 def wait_for_login(
-    context: Any, page: Any, *, timeout_s: float = 600, poll_s: float = 2, log: Log = print
+    context: Any,
+    page: Any,
+    *,
+    timeout_s: float = 600,
+    poll_s: float = 2,
+    log: Log = print,
+    should_stop: Callable[[], bool] = lambda: False,
 ) -> None:
     page.goto(TIKTOK_HOME, wait_until="domcontentloaded")
     if is_logged_in(context):
@@ -250,6 +573,8 @@ def wait_for_login(
         if is_logged_in(context):
             log("Logged in.")
             return
+        if should_stop():
+            raise CollectorError("Stopped.")
         page.wait_for_timeout(int(poll_s * 1000))
     raise CollectorError("Timed out waiting for you to log in to TikTok. Run the command again.")
 
@@ -263,6 +588,30 @@ def detect_username(page: Any) -> str | None:
         return None
     match = re.search(r"/@([^/?#]+)", href or "")
     return match.group(1) if match else None
+
+
+@contextmanager
+def _helper_ignores_control_c() -> Iterator[None]:
+    """Start Playwright's helper program in its own session (Mac/Linux).
+
+    Control-C in Terminal goes to every program started from it. Without this,
+    the helper that drives Chrome would quit mid-step, and the app couldn't
+    stop cleanly (save progress, write the spreadsheet, close Chrome).
+    """
+    if os.name != "posix":
+        yield
+        return
+    original = asyncio.create_subprocess_exec
+
+    async def in_own_session(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("start_new_session", True)
+        return await original(*args, **kwargs)
+
+    asyncio.create_subprocess_exec = in_own_session
+    try:
+        yield
+    finally:
+        asyncio.create_subprocess_exec = original
 
 
 @contextmanager
@@ -292,7 +641,10 @@ def open_tiktok_browser(
     elif browser == "chrome":
         options["channel"] = "chrome"
 
-    with sync_playwright() as playwright:
+    with _helper_ignores_control_c():
+        playwright = sync_playwright().start()
+    interrupted = False
+    try:
         try:
             context = playwright.chromium.launch_persistent_context(**options)
         except PlaywrightError as exc:
@@ -311,8 +663,18 @@ def open_tiktok_browser(
             yield context, page
         except PlaywrightError as exc:
             raise CollectorError(f"The browser closed or stopped responding ({exc}).") from exc
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
         finally:
+            if not interrupted:  # after a hard stop, more browser calls can hang
+                try:
+                    context.close()
+                except Exception:
+                    pass  # already closed by the person running the tool
+    finally:
+        if not interrupted:
             try:
-                context.close()
-            except PlaywrightError:
-                pass  # already closed by the person running the tool
+                playwright.stop()
+            except Exception:
+                pass

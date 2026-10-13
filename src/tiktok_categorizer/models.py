@@ -43,18 +43,39 @@ class SavedVideo:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def save_video_list(path: Path, videos: list[SavedVideo], username: str | None) -> None:
+@dataclass
+class VideoList:
+    videos: list[SavedVideo]
+    username: str | None = None
+    complete: bool = True  # False while a collection is still in progress (or was cut short)
+
+
+def save_video_list(
+    path: Path, videos: list[SavedVideo], username: str | None, *, complete: bool = True
+) -> None:
     payload = {
         "username": username,
         "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "complete": complete,
         "videos": [video.to_dict() for video in videos],
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Write a temporary file first so a crash mid-write never leaves a broken list.
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
-def load_video_list(path: Path) -> list[SavedVideo]:
+def read_video_list(path: Path) -> VideoList:
     data = json.loads(path.read_text(encoding="utf-8"))
     entries = data.get("videos") if isinstance(data, dict) else data
     if not isinstance(entries, list):
         raise ValueError(f"{path} does not contain a list of saved videos")
-    return [SavedVideo.from_dict(entry) for entry in entries]
+    videos = [SavedVideo.from_dict(entry) for entry in entries]
+    if not isinstance(data, dict):
+        return VideoList(videos)
+    username = data.get("username") if isinstance(data.get("username"), str) else None
+    return VideoList(videos, username, data.get("complete", True) is not False)
+
+
+def load_video_list(path: Path) -> list[SavedVideo]:
+    return read_video_list(path).videos
