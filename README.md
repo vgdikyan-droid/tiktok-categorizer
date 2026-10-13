@@ -58,23 +58,49 @@ tiktok-categorize                  # everything
 ```
 
 A browser window opens. Log in if asked, then leave the window alone while it
-scrolls. When it finishes you'll have:
+scrolls. When it finishes, the spreadsheet opens by itself. Your results are kept in
+**Documents → TikTok-Saved-Videos**, outside the app's folder, so downloading a newer
+version of the app never loses them:
 
-- `tiktok_saved_videos.xlsx`, the spreadsheet. Open it with `open tiktok_saved_videos.xlsx`
-  (Numbers or Excel), or upload it to Google Sheets.
+- `tiktok_saved_videos.xlsx`, the spreadsheet (Numbers or Excel; you can also upload it
+  to Google Sheets).
 - `tiktok_saved_videos.json`, the list of videos it found, so you can re-sort without
   scrolling TikTok again (see below).
+
+### Thousands of saved videos
+
+Long runs are fine. After TikTok's page shows your first saves, the app asks
+TikTok for the rest batch by batch from the same tab, so the page doesn't fill up
+with thousands of videos and run out of memory (if TikTok won't answer that way,
+it scrolls instead, skipping video previews). It also saves its progress every
+100 videos.
+
+If something interrupts it, nothing found so far is lost:
+
+- If the TikTok tab crashes, the app reopens it by itself and carries on.
+- **Press Control-C once** to stop cleanly: it saves its progress and writes
+  `tiktok_saved_videos (so far).xlsx` with everything found until then. Press it
+  twice to quit at once (progress up to the last save is kept).
+- **Run the same command again and it carries on** from where it stopped instead
+  of starting over. When it finishes, you get the full `tiktok_saved_videos.xlsx`.
+  Use `--start-over` if you ever want a fresh run.
+
+An unfinished run never replaces a finished spreadsheet or list from an earlier
+run; those only change when a run gets to the end. A `--limit` run is just a quick
+test: it writes `tiktok_saved_videos (test).xlsx` and leaves everything else alone.
 
 Options worth knowing:
 
 | Option | What it does |
 |---|---|
-| `--user yourname` | Your TikTok username, if it isn't detected automatically |
-| `-o my_saves.xlsx` | Choose the spreadsheet's name/location |
-| `--limit 100` | Only read your 100 most recent saves |
+| `--user yourname` | Your TikTok username, so it doesn't have to ask |
+| `--limit 100` | A quick test on your 100 most recent saves |
 | `--ai` | Sort with Claude for much better results (see below) |
+| `--from-list` | Re-sort the videos from your last run without opening TikTok |
 | `--categories my_categories.json` | Use your own categories |
-| `--from-list tiktok_saved_videos.json` | Re-sort a previous run's videos without opening TikTok |
+| `--start-over` | Ignore an unfinished earlier run and start from the top |
+| `-o path/to/file.xlsx` | Save the spreadsheet somewhere else |
+| `--no-open` | Don't open the spreadsheet when finished |
 
 ## Better sorting with Claude (`--ai`)
 
@@ -95,8 +121,8 @@ tiktok-categorize --ai
   number, with somewhat less careful sorting.
 - If Claude can't be reached, or declines a batch, those videos are sorted
   with the keyword rules instead and the run still finishes.
-- Already scrolled once? `tiktok-categorize --from-list tiktok_saved_videos.json --ai`
-  re-sorts without opening TikTok again.
+- Already scrolled once? `tiktok-categorize --from-list --ai` re-sorts your last
+  run's videos without opening TikTok again.
 
 ## Your own categories
 
@@ -105,7 +131,7 @@ Print the built-in categories, edit them, and pass the file back:
 ```bash
 tiktok-categorize --print-default-categories > my_categories.json
 # edit my_categories.json: rename, delete or add categories
-tiktok-categorize --from-list tiktok_saved_videos.json --categories my_categories.json
+tiktok-categorize --from-list --categories my_categories.json
 ```
 
 Each category has:
@@ -133,8 +159,8 @@ or end with it (`outfit` matches `#outfitinspo`).
   so use it at your own discretion.
 - Only the videos in Favorites are read. Separate *Collections* folders and
   saved sounds or effects are not included.
-- Your spreadsheet and video lists are ignored by git (`.gitignore`), so they
-  won't be committed by accident.
+- Your spreadsheet and video lists live in your Documents folder, not in the
+  app's folder, so they're never part of the code.
 
 ## Development
 

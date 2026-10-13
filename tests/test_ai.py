@@ -113,3 +113,10 @@ def test_bad_credentials_stop_the_ai_mode():
     error = anthropic.AuthenticationError("bad key", response=httpx2.Response(401, request=REQUEST), body=None)
     with pytest.raises(AIUnavailable, match="API key"):
         _classifier(FakeClient(error)).classify_all(_videos("x"))
+
+
+def test_a_missing_api_key_stops_the_ai_mode_with_a_clear_message():
+    error = TypeError('"Could not resolve authentication method. Expected one of api_key, auth_token, '
+                      'or credentials to be set."')
+    with pytest.raises(AIUnavailable, match="No Anthropic API key"):
+        _classifier(FakeClient(error)).classify_all(_videos("x"))

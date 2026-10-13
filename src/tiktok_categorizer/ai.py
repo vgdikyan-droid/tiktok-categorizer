@@ -138,6 +138,12 @@ class AIClassifier:
         except anthropic.APIConnectionError:
             self.log("  Could not reach Claude; using keyword rules for this batch.")
             return None
+        except TypeError as exc:  # how the SDK reports that no key or login was found
+            if "authentication" not in str(exc).lower():
+                raise
+            raise AIUnavailable(
+                "No Anthropic API key found. Set ANTHROPIC_API_KEY (or run `ant auth login`) to use --ai."
+            ) from exc
 
         if response.stop_reason in ("refusal", "max_tokens"):
             self.log(f"  Claude stopped early ({response.stop_reason}); using keyword rules for this batch.")
